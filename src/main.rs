@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::future::Future;
-use std::task::{ready, Poll};
+use std::pin::Pin;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -11,10 +12,11 @@ use axum::routing::get;
 use axum::Router;
 use bytes::{Buf, Bytes, BytesMut};
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use tokio::fs::File;
 use tokio::net::TcpListener;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
-use tower::Service;
+use tower::{Layer, Service};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn swag() -> Response {
-    let f = tokio::fs::File::open("Cargo.toml").await.unwrap();
+    let f = File::open("Cargo.toml").await.unwrap();
     let rs = ReaderStream::new(f);
     Body::from_stream(rs).into_response()
 }
@@ -53,11 +55,11 @@ async fn handler(Path(count): Path<usize>) -> Response {
 #[derive(Clone)]
 struct ThrottleLayer {
     bytes_per_period: usize,
-    period: std::time::Duration,
+    period: Duration,
 }
 
 impl ThrottleLayer {
-    fn new(bytes_per_period: usize, period: std::time::Duration) -> Self {
+    fn new(bytes_per_period: usize, period: Duration) -> Self {
         Self {
             bytes_per_period,
             period,
@@ -65,7 +67,7 @@ impl ThrottleLayer {
     }
 }
 
-impl<S> tower::Layer<S> for ThrottleLayer {
+impl<S> Layer<S> for ThrottleLayer {
     type Service = ThrottleService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
@@ -81,7 +83,7 @@ impl<S> tower::Layer<S> for ThrottleLayer {
 struct ThrottleService<S> {
     inner: S,
     bytes_per_period: usize,
-    period: std::time::Duration,
+    period: Duration,
 }
 
 impl<S, R> Service<R> for ThrottleService<S>
@@ -94,7 +96,7 @@ where
 
     type Future = ThrottleFut<S::Future>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -112,7 +114,7 @@ struct ThrottleFut<F> {
     #[pin]
     fut: F,
     bytes_per_period: usize,
-    period: std::time::Duration,
+    period: Duration,
 }
 
 impl<F> Future for ThrottleFut<F>
@@ -121,10 +123,10 @@ where
 {
     type Output = F::Output;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        this.fut.poll(cx).map(|resp| {
-            resp.map(|response| {
+        this.fut.poll(cx).map(|res| {
+            res.map(|response| {
                 let (parts, body) = response.into_parts();
                 let body = Body::new(ThrottleBody::new(
                     body,
@@ -144,7 +146,7 @@ struct ThrottleBody<B> {
     #[pin]
     sleep: Option<Sleep>,
     buf: BytesMut,
-    period: std::time::Duration,
+    period: Duration,
     max_read: usize,
     trailers: Option<HeaderMap>,
 }
@@ -171,8 +173,8 @@ where
     type Error = B::Error;
 
     fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
 
@@ -227,7 +229,7 @@ where
         self.buf.is_empty() && self.trailers.is_none() && self.body.is_end_stream()
     }
 
-    fn size_hint(&self) -> http_body::SizeHint {
+    fn size_hint(&self) -> SizeHint {
         let size_hint_inner = self.body.size_hint();
         let lower = size_hint_inner.lower();
         let upper = size_hint_inner.upper();
